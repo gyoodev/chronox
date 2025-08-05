@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:sizer/sizer.dart';
 
 import '../../core/app_export.dart';
+import '../../core/services/weather_service.dart';
 import './widgets/quick_tools_widget.dart';
 import './widgets/recent_calculations_widget.dart';
 import './widgets/today_highlights_widget.dart';
@@ -16,16 +17,17 @@ class HomeDashboard extends StatefulWidget {
 
 class _HomeDashboardState extends State<HomeDashboard> {
   final ScrollController _scrollController = ScrollController();
+  final WeatherService _weatherService = WeatherService();
   bool _isRefreshing = false;
 
-  // Mock data for weather
-  final Map<String, dynamic> _weatherData = {
-    "temperature": 24,
-    "condition": "Partly Cloudy",
-    "location": "New York, NY",
-    "humidity": 65,
-    "windSpeed": 12,
-    "lastUpdated": "2025-08-05 10:15:00",
+  // Weather data - now loaded from real API
+  Map<String, dynamic> _weatherData = {
+    "temperature": 0,
+    "condition": "Loading...",
+    "location": "Loading...",
+    "humidity": 0,
+    "windSpeed": 0,
+    "lastUpdated": DateTime.now().toString(),
   };
 
   // Mock data for quick tools
@@ -131,6 +133,7 @@ class _HomeDashboardState extends State<HomeDashboard> {
   void initState() {
     super.initState();
     _initializeHighlights();
+    _loadWeatherData();
   }
 
   void _initializeHighlights() {
@@ -147,6 +150,81 @@ class _HomeDashboardState extends State<HomeDashboard> {
       "daysUntilWeekend": daysUntilWeekend > 0 ? daysUntilWeekend : 0,
       "currentTime": currentTime,
     };
+  }
+
+  Future<void> _loadWeatherData() async {
+    try {
+      // Get current location
+      final position = await _weatherService.getCurrentLocation();
+
+      if (position != null) {
+        // Get location name
+        final locationName = await _weatherService.getLocationName(
+          position.latitude,
+          position.longitude,
+        );
+
+        // Get weather data
+        final weatherData = await _weatherService.getWeatherByCoordinates(
+          position.latitude,
+          position.longitude,
+        );
+
+        if (weatherData != null && mounted) {
+          final current = weatherData['current'];
+          setState(() {
+            _weatherData = {
+              "temperature": current['temperature'],
+              "condition": current['condition'],
+              "location": locationName,
+              "humidity": current['humidity'],
+              "windSpeed": current['windSpeed'],
+              "lastUpdated": DateTime.now().toString(),
+            };
+          });
+        }
+      } else {
+        // Fallback to a default city
+        await _loadWeatherForCity('New York');
+      }
+    } catch (e) {
+      print('Error loading weather data: $e');
+      // Fallback to a default city
+      await _loadWeatherForCity('New York');
+    }
+  }
+
+  Future<void> _loadWeatherForCity(String cityName) async {
+    try {
+      final weatherData = await _weatherService.getWeatherByCity(cityName);
+
+      if (weatherData != null && mounted) {
+        final current = weatherData['current'];
+        setState(() {
+          _weatherData = {
+            "temperature": current['temperature'],
+            "condition": current['condition'],
+            "location": cityName,
+            "humidity": current['humidity'],
+            "windSpeed": current['windSpeed'],
+            "lastUpdated": DateTime.now().toString(),
+          };
+        });
+      }
+    } catch (e) {
+      print('Error loading weather for city: $e');
+      // Keep the loading state or show error
+      setState(() {
+        _weatherData = {
+          "temperature": 0,
+          "condition": "Weather Unavailable",
+          "location": "Unable to Load",
+          "humidity": 0,
+          "windSpeed": 0,
+          "lastUpdated": DateTime.now().toString(),
+        };
+      });
+    }
   }
 
   String _getGreeting() {
@@ -194,11 +272,8 @@ class _HomeDashboardState extends State<HomeDashboard> {
       _isRefreshing = true;
     });
 
-    // Simulate API call delay
-    await Future.delayed(Duration(seconds: 2));
-
-    // Update weather data timestamp
-    _weatherData['lastUpdated'] = DateTime.now().toString();
+    // Reload weather data with real API call
+    await _loadWeatherData();
 
     // Refresh highlights data
     _initializeHighlights();
@@ -274,21 +349,18 @@ class _HomeDashboardState extends State<HomeDashboard> {
                           _getGreeting(),
                           style: AppTheme.lightTheme.textTheme.headlineSmall
                               ?.copyWith(
-                                fontWeight: FontWeight.w700,
-                                color: AppTheme.lightTheme.primaryColor,
-                              ),
+                            fontWeight: FontWeight.w700,
+                            color: AppTheme.lightTheme.primaryColor,
+                          ),
                         ),
                         SizedBox(height: 0.5.h),
                         Text(
                           _getCurrentDate(),
-                          style: AppTheme.lightTheme.textTheme.bodyLarge
-                              ?.copyWith(
-                                color:
-                                    AppTheme
-                                        .lightTheme
-                                        .colorScheme
-                                        .onSurfaceVariant,
-                              ),
+                          style:
+                              AppTheme.lightTheme.textTheme.bodyLarge?.copyWith(
+                            color: AppTheme
+                                .lightTheme.colorScheme.onSurfaceVariant,
+                          ),
                         ),
                       ],
                     ),
