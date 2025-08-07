@@ -1,23 +1,25 @@
+import 'dart:convert';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:geocoding/geocoding.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 class WeatherService {
-  static const String _baseUrl = 'https://api.openweathermap.org/data/2.5';
-  static const String _geocodingUrl = 'https://api.openweathermap.org/geo/1.0';
+  static const String _baseUrl = 'http://dataservice.accuweather.com';
   late final Dio _dio;
-  late final String _apiKey;
+  late final Future<String> _apiKey;
 
   WeatherService() {
     _dio = Dio();
-    _apiKey = _getApiKey();
+    _apiKey = _loadApiKey();
   }
 
-  String _getApiKey() {
-    // In a real app, load from env.json or secure storage
-    return 'your-openweathermap-api-key-here';
+  Future<String> _loadApiKey() async {
+    final String jsonString = await rootBundle.loadString('env.json');
+    final Map<String, dynamic> env = json.decode(jsonString);
+    return env['ACCUWEATHER_API_KEY'] ?? '';
   }
 
   // Get current location using device GPS
@@ -48,11 +50,20 @@ class WeatherService {
   Future<bool> _requestLocationPermission() async {
     if (kIsWeb) return true;
 
-    final status = await Permission.location.status;
-    if (status.isGranted) return true;
+    PermissionStatus status = await Permission.location.status;
 
-    final result = await Permission.location.request();
-    return result.isGranted;
+    if (status.isDenied) {
+      status = await Permission.location.request();
+      if (status.isGranted) {
+        return true;
+      }
+    } else if (status.isGranted) {
+      return true;
+    } else if (status.isPermanentlyDenied) {
+      await openAppSettings();
+    }
+
+    return false;
   }
 
   // Get location name from coordinates
@@ -71,221 +82,191 @@ class WeatherService {
     return 'Unknown Location';
   }
 
-  // Get weather data by coordinates
+  Future<String?> _getLocationKeyFromCoords(double lat, double lon) async {
+    final apiKey = await _apiKey;
+    try {
+      final response = await _dio.get(
+        '$_baseUrl/locations/v1/cities/geoposition/search',
+        queryParameters: {
+          'apikey': apiKey,
+          'q': '$lat,$lon',
+        },
+      );
+      if (response.statusCode == 200) {
+        return response.data['Key'];
+      }
+    } catch (e) {
+      print('Error getting location key from coords: $e');
+    }
+    return null;
+  }
+
+  Future<String?> _getLocationKeyFromCity(String cityName) async {
+    final apiKey = await _apiKey;
+    try {
+      final response = await _dio.get(
+        '$_baseUrl/locations/v1/cities/search',
+        queryParameters: {
+          'apikey': apiKey,
+          'q': cityName,
+        },
+      );
+      if (response.statusCode == 200 && response.data.isNotEmpty) {
+        return response.data[0]['Key'];
+      }
+    } catch (e) {
+      print('Error getting location key from city: $e');
+    }
+    return null;
+  }
+
   Future<Map<String, dynamic>?> getWeatherByCoordinates(
     double lat,
     double lon,
   ) async {
-    try {
-      final response = await _dio.get(
-        '$_baseUrl/onecall',
-        queryParameters: {
-          'lat': lat,
-          'lon': lon,
-          'appid': _apiKey,
-          'units': 'metric',
-          'exclude': 'minutely',
-        },
-      );
-
-      if (response.statusCode == 200) {
-        return _parseWeatherData(response.data);
-      }
-    } catch (e) {
-      print('Error fetching weather: $e');
-    }
-    return null;
+    final locationKey = await _getLocationKeyFromCoords(lat, lon);
+    if (locationKey == null) return null;
+    return _getWeatherByLocationKey(locationKey);
   }
 
-  // Get weather data by city name
   Future<Map<String, dynamic>?> getWeatherByCity(String cityName) async {
+    final locationKey = await _getLocationKeyFromCity(cityName);
+    if (locationKey == null) return null;
+    return _getWeatherByLocationKey(locationKey);
+  }
+
+  Future<Map<String, dynamic>?> _getWeatherByLocationKey(
+      String locationKey) async {
+    final apiKey = await _apiKey;
     try {
-      // First get coordinates for the city
-      final geoResponse = await _dio.get(
-        '$_geocodingUrl/direct',
-        queryParameters: {
-          'q': cityName,
-          'limit': 1,
-          'appid': _apiKey,
-        },
+      final currentConditionsFuture = _dio.get(
+        '$_baseUrl/currentconditions/v1/$locationKey',
+        queryParameters: {'apikey': apiKey, 'details': 'true'},
       );
 
-      if (geoResponse.statusCode == 200 &&
-          geoResponse.data is List &&
-          (geoResponse.data as List).isNotEmpty) {
-        final location = geoResponse.data[0];
-        final lat = location['lat'];
-        final lon = location['lon'];
+      final hourlyForecastFuture = _dio.get(
+        '$_baseUrl/forecasts/v1/hourly/12hour/$locationKey',
+        queryParameters: {'apikey': apiKey, 'metric': 'true'},
+      );
 
-        return await getWeatherByCoordinates(lat, lon);
+      final dailyForecastFuture = _dio.get(
+        '$_baseUrl/forecasts/v1/daily/5day/$locationKey',
+        queryParameters: {'apikey': apiKey, 'metric': 'true'},
+      );
+
+      final responses = await Future.wait([
+        currentConditionsFuture,
+        hourlyForecastFuture,
+        dailyForecastFuture,
+      ]);
+
+      if (responses.every((res) => res.statusCode == 200)) {
+        return _parseWeatherData(
+          responses[0].data[0],
+          responses[1].data,
+          responses[2].data,
+        );
       }
     } catch (e) {
-      print('Error fetching weather by city: $e');
+      print('Error fetching weather by location key: $e');
     }
     return null;
   }
 
-  Map<String, dynamic> _parseWeatherData(Map<String, dynamic> data) {
-    final current = data['current'];
-    final hourly = data['hourly'] as List;
-    final daily = data['daily'] as List;
-    final alerts = data['alerts'] as List? ?? [];
-
+  Map<String, dynamic> _parseWeatherData(
+    Map<String, dynamic> current,
+    List<dynamic> hourly,
+    Map<String, dynamic> daily,
+  ) {
     return {
       'current': {
-        'temperature': current['temp'].round(),
-        'condition': _getWeatherCondition(current['weather'][0]['main']),
-        'description': current['weather'][0]['description'],
-        'feelsLike': current['feels_like'].round(),
-        'humidity': current['humidity'],
+        'temperature': current['Temperature']['Metric']['Value'].round(),
+        'condition': _getWeatherCondition(current['WeatherText']),
+        'description': current['WeatherText'],
+        'feelsLike':
+            current['RealFeelTemperature']['Metric']['Value'].round(),
+        'humidity': current['RelativeHumidity'],
         'windSpeed':
-            (current['wind_speed'] * 3.6).round(), // Convert m/s to km/h
-        'pressure': current['pressure'],
-        'uvIndex': current['uvi'].round(),
-        'visibility': (current['visibility'] / 1000).round(), // Convert m to km
+            current['Wind']['Speed']['Metric']['Value'].round(),
+        'pressure': current['Pressure']['Metric']['Value'].round(),
+        'uvIndex': current['UVIndex'],
+        'visibility':
+            current['Visibility']['Metric']['Value'].round(),
       },
-      'hourly': hourly.take(8).map((hour) {
+      'hourly': hourly.map((hour) {
         return {
-          'time': _formatHourlyTime(hour['dt']),
-          'temperature': hour['temp'].round(),
-          'condition': _getWeatherCondition(hour['weather'][0]['main']),
-          'precipitation': ((hour['pop'] ?? 0) * 100).round(),
+          'time': _formatHourlyTime(hour['EpochDateTime']),
+          'temperature': hour['Temperature']['Value'].round(),
+          'condition': _getWeatherCondition(hour['IconPhrase']),
+          'precipitation': hour['PrecipitationProbability'],
         };
       }).toList(),
-      'daily': daily.take(7).map((day) {
+      'daily': (daily['DailyForecasts'] as List).map((day) {
         return {
-          'day': _formatDailyTime(day['dt']),
-          'condition': _getWeatherCondition(day['weather'][0]['main']),
-          'high': day['temp']['max'].round(),
-          'low': day['temp']['min'].round(),
-          'precipitation': ((day['pop'] ?? 0) * 100).round(),
-          'morning': day['temp']['morn'].round(),
-          'afternoon': day['temp']['day'].round(),
-          'evening': day['temp']['eve'].round(),
-          'night': day['temp']['night'].round(),
-          'humidity': day['humidity'],
-          'windSpeed': (day['wind_speed'] * 3.6).round(),
-          'uvIndex': day['uvi'].round(),
+          'day': _formatDailyTime(day['EpochDate']),
+          'condition': _getWeatherCondition(day['Day']['IconPhrase']),
+          'high': day['Temperature']['Maximum']['Value'].round(),
+          'low': day['Temperature']['Minimum']['Value'].round(),
+          'precipitation': day['Day']['PrecipitationProbability'],
+          'morning': day['RealFeelTemperature']['Maximum']['Value'].round(),
+          'afternoon': day['RealFeelTemperature']['Maximum']['Value'].round(),
+          'evening': day['RealFeelTemperature']['Minimum']['Value'].round(),
+          'night': day['RealFeelTemperature']['Minimum']['Value'].round(),
+          'humidity': 0, // Not available in daily forecast
+          'windSpeed':
+              day['Day']['Wind']['Speed']['Value'].round(),
+          'uvIndex': 0, // Not available in daily forecast
         };
       }).toList(),
-      'alerts': alerts.map((alert) {
-        return {
-          'title': alert['event'] ?? 'Weather Alert',
-          'severity': _getAlertSeverity(alert['event'] ?? ''),
-          'time': 'Valid until ${_formatAlertTime(alert['end'])}',
-          'description': alert['description'] ?? '',
-          'startTime': _formatAlertTime(alert['start']),
-          'endTime': _formatAlertTime(alert['end']),
-        };
-      }).toList(),
+      'alerts': [], // AccuWeather alerts API is separate and not implemented here
     };
   }
 
-  String _getWeatherCondition(String main) {
-    switch (main.toLowerCase()) {
-      case 'clear':
-        return 'sunny';
-      case 'clouds':
-        return 'cloudy';
-      case 'rain':
-      case 'drizzle':
-        return 'rainy';
-      case 'thunderstorm':
-        return 'thunderstorm';
-      case 'snow':
-        return 'snowy';
-      case 'mist':
-      case 'fog':
-        return 'foggy';
-      default:
-        return 'partly_cloudy';
-    }
+  String _getWeatherCondition(String phrase) {
+    final p = phrase.toLowerCase();
+    if (p.contains('sunny') || p.contains('clear')) return 'sunny';
+    if (p.contains('cloudy') || p.contains('clouds')) return 'cloudy';
+    if (p.contains('rain') || p.contains('showers')) return 'rainy';
+    if (p.contains('t-storms') || p.contains('thunderstorm')) return 'thunderstorm';
+    if (p.contains('snow')) return 'snowy';
+    if (p.contains('fog') || p.contains('mist')) return 'foggy';
+    return 'partly_cloudy';
   }
 
-  String _getAlertSeverity(String event) {
-    final lowercaseEvent = event.toLowerCase();
-    if (lowercaseEvent.contains('warning') ||
-        lowercaseEvent.contains('severe') ||
-        lowercaseEvent.contains('tornado') ||
-        lowercaseEvent.contains('hurricane')) {
-      return 'severe';
-    } else if (lowercaseEvent.contains('watch') ||
-        lowercaseEvent.contains('advisory')) {
-      return 'moderate';
-    }
-    return 'minor';
+  String _formatHourlyTime(int epoch) {
+    final dt = DateTime.fromMillisecondsSinceEpoch(epoch * 1000);
+    return '${dt.hour.toString().padLeft(2, '0')}:00';
   }
 
-  String _formatHourlyTime(int timestamp) {
-    final dateTime = DateTime.fromMillisecondsSinceEpoch(timestamp * 1000);
+  String _formatDailyTime(int epoch) {
+    final dt = DateTime.fromMillisecondsSinceEpoch(epoch * 1000);
     final now = DateTime.now();
-
-    if (dateTime.hour == now.hour && dateTime.day == now.day) {
-      return 'Now';
-    }
-
-    return '${dateTime.hour.toString().padLeft(2, '0')}:00';
+    if (dt.day == now.day) return 'Today';
+    if (dt.day == now.day + 1) return 'Tomorrow';
+    final weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    return weekdays[dt.weekday - 1];
   }
 
-  String _formatDailyTime(int timestamp) {
-    final dateTime = DateTime.fromMillisecondsSinceEpoch(timestamp * 1000);
-    final now = DateTime.now();
-
-    if (dateTime.day == now.day && dateTime.month == now.month) {
-      return 'Today';
-    } else if (dateTime.day == now.day + 1 && dateTime.month == now.month) {
-      return 'Tomorrow';
-    }
-
-    final weekdays = [
-      'Monday',
-      'Tuesday',
-      'Wednesday',
-      'Thursday',
-      'Friday',
-      'Saturday',
-      'Sunday'
-    ];
-    return weekdays[dateTime.weekday - 1];
-  }
-
-  String _formatAlertTime(int timestamp) {
-    final dateTime = DateTime.fromMillisecondsSinceEpoch(timestamp * 1000);
-    return '${dateTime.hour.toString().padLeft(2, '0')}:${dateTime.minute.toString().padLeft(2, '0')}';
-  }
-
-  // Search for cities (for location search functionality)
   Future<List<Map<String, dynamic>>> searchCities(String query) async {
     if (query.isEmpty) return [];
-
+    final apiKey = await _apiKey;
     try {
       final response = await _dio.get(
-        '$_geocodingUrl/direct',
+        '$_baseUrl/locations/v1/cities/autocomplete',
         queryParameters: {
+          'apikey': apiKey,
           'q': query,
-          'limit': 5,
-          'appid': _apiKey,
         },
       );
 
       if (response.statusCode == 200 && response.data is List) {
         return (response.data as List).map((city) {
-          final country = city['country'] ?? '';
-          final state = city['state'] ?? '';
-          final name = city['name'] ?? '';
-
-          String displayName = name;
-          if (state.isNotEmpty) {
-            displayName += ', $state';
-          }
-          if (country.isNotEmpty) {
-            displayName += ', $country';
-          }
-
           return {
-            'name': displayName,
-            'lat': city['lat'],
-            'lon': city['lon'],
+            'name': city['LocalizedName'] +
+                ', ' +
+                city['Country']['LocalizedName'],
+            'lat': 0.0, // AccuWeather autocomplete doesn't provide lat/lon
+            'lon': 0.0,
           };
         }).toList();
       }

@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:sizer/sizer.dart';
 
 import '../../core/app_export.dart';
+import '../../core/services/session_service.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({Key? key}) : super(key: key);
@@ -76,23 +77,28 @@ class _SplashScreenState extends State<SplashScreen>
       // Start loading animation
       _loadingAnimationController.repeat();
 
-      // Task 1: Load user preferences
-      await _updateProgress(0.2, 'Loading preferences...');
+      // Task 1: Create user session
+      await _updateProgress(0.15, 'Creating session...');
+      await SessionService().createSession();
       await Future.delayed(const Duration(milliseconds: 500));
 
-      // Task 2: Initialize weather API connections
-      await _updateProgress(0.4, 'Connecting to weather services...');
+      // Task 2: Load user preferences
+      await _updateProgress(0.3, 'Loading preferences...');
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      // Task 3: Initialize weather API connections
+      await _updateProgress(0.45, 'Connecting to weather services...');
       await Future.delayed(const Duration(milliseconds: 600));
 
-      // Task 3: Prepare cached conversion data
+      // Task 4: Prepare cached conversion data
       await _updateProgress(0.6, 'Preparing conversion data...');
       await Future.delayed(const Duration(milliseconds: 500));
 
-      // Task 4: Detect IP-based location
+      // Task 5: Detect IP-based location
       await _updateProgress(0.8, 'Detecting location...');
       await Future.delayed(const Duration(milliseconds: 700));
 
-      // Task 5: Final setup
+      // Task 6: Final setup
       await _updateProgress(1.0, 'Almost ready...');
       await Future.delayed(const Duration(milliseconds: 400));
 
